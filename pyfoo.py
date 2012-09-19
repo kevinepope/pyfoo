@@ -1,12 +1,22 @@
 import urllib
 import urllib2
-import json
+import simplejson as json
+import base64
+import logging
     
 from UserList import UserList
 from UserDict import UserDict
 
+try:
+    from google.appengine.api import urlfetch
+    APPENGINE = True
+except:
+    APPENGINE = False
+
 BOOLEAN_FIELDS = ('IsAccountOwner', 'IsRequired', 'IsPublic', 'CreateForms', 
         'CreateReports', 'CreateThemes', 'AdminAccess', 'Success')
+
+class HTTPErrorAppEngine(Exception): pass
 
 class WufooObject(object):
     def __init__(self, api, json_object):
@@ -87,6 +97,12 @@ class Form(WufooObject):
         entries_json = self.api.make_call(url)
         entries = [Entry(fields=entry, form=self) for entry in entries_json['Entries']]
         return entries
+
+    def get_entry(self, entry_key):
+        url = "%s?Filter1=EntryId+Is_equal_to+%s" % (self.LinkEntries, entry_key)
+        response = self.api.make_call(url)
+        entry = Entry(fields=response['Entries'][0], form=self)
+        return entry
     
     def get_field(self, title):
         field = [field for field in self.fields if field.Title == title]
@@ -229,6 +245,7 @@ class PyfooAPI(object):
     def __init__(self, account=None, api_key=None, email=None, password=None, integration_key=None):
         self.account = account
         self.api_key = api_key
+        self.user_name = email
         if email and password:
             url = 'https://wufoo.com/api/v3/login.json'
             data = {'email': email, 'password': password, 'integrationKey': integration_key}
@@ -239,12 +256,62 @@ class PyfooAPI(object):
             self.api_key = response['ApiKey']
             self.account = response['Subdomain']
             
-    def make_call(self, url, post_params=None, method=None):
-        password_mgr = urllib2.HTTPPasswordMgrWithDefaultRealm()
+    def make_call(self, url, post_params=None, method='GET'):
+        
         if self.account:
             top_level_url = "https://%s.wufoo.com/api/v3" % self.account
         else:
             top_level_url = "https://wufoo.com/api/v3"
+        
+        
+        if APPENGINE:
+            return self._appengine_fetch(url, post_params, method)
+        return self._urllib2_fetch(url, post_params, method)
+    
+    def _build_get_uri(self, uri, params):
+        if params and len(params) > 0:
+            if uri.find('?') > 0:
+                if uri[-1] != '&':
+                    uri += '&'
+                uri = uri + urllib.urlencode(params)
+            else:
+                uri = uri + '?' + urllib.urlencode(params)
+        return uri
+    
+    def _appengine_fetch(self, uri, post_params, method):
+        if not post_params:
+            post_params = {}
+        
+        if method == 'GET':
+            uri = self._build_get_uri(uri, post_params)
+        
+        try:
+            httpmethod = getattr(urlfetch, method)
+        except AttributeError:
+            raise NotImplementedError(
+                "Google App Engine does not support method '%s'" % method)
+        
+
+        authstring = base64.encodestring('%s:%s' % (self.api_key, self.user_name))
+        authstring = authstring.replace('\n', '')
+        r = urlfetch.fetch(url=uri, payload=urllib.urlencode(post_params),
+            method=httpmethod,
+            headers={'Content-Type': 'application/x-www-form-urlencoded',
+                'Authorization': 'Basic %s' % authstring})
+        if r.status_code >= 300:
+            raise HTTPErrorAppEngine("HTTP %s: %s" % \
+                (r.status_code, r.content))
+        
+        try:
+            json_object = json.loads(r.content)
+        except Exception, ex:
+            logging.error('Invalid response: %s' % ex)
+            raise ex
+            
+        return json_object
+    
+    def _urllib2_fetch(self, url, post_params, method):
+        password_mgr = urllib2.HTTPPasswordMgrWithDefaultRealm()
         password_mgr.add_password(None, top_level_url, self.api_key, "footastic")
         handler = urllib2.HTTPBasicAuthHandler(password_mgr)
         opener = urllib2.build_opener(handler)
@@ -259,7 +326,7 @@ class PyfooAPI(object):
         else:
             response = opener.open(url)
         
-        json_string = response.read()        
+        json_string = response.read()       
         
         post_params_string = ''
         if post_params:
@@ -274,8 +341,12 @@ class PyfooAPI(object):
             print url
             print json_string
             
-            raise ex
+            raise ex            
         return json_object
+
+    def get_form(self, form_hash):      
+        form_json = self.make_call('https://%s.wufoo.com/api/v3/forms/%s.json' % (self.account, form_hash))
+        return Form(self, form_json['Forms'][0])
 
     # Users
     @property
